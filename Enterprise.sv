@@ -234,7 +234,8 @@ localparam CONF_STR = {
 	"P1-;",
 	"P1O[3:2],Stereo Mix,none,25%,50%,100%;",
 	
-	"R[0],Reset & Apply;",
+	"R[0],Reset;",
+	"R[12],Cold Reset;",
 	"J,Fire 1,Fire 2;",
 	"V,v",`BUILD_DATE 
 };
@@ -378,15 +379,6 @@ wd17xx fdd0
 );
 
 assign CLK_VIDEO = clock56;
-// CE_PIXEL is driven by the video_mixer (to allow scandoubler/fsync adjustments).
-// Do not assign it directly from ce_pix here to avoid multiple drivers.
-
-//assign VGA_DE = ~(hblank|vblank);
-//assign VGA_HS = hsync;
-//assign VGA_VS = vsync;
-//assign VGA_R  = { r, r, r[2:1] };
-//assign VGA_G  = { g, g, g[2:1] };
-//assign VGA_B  = { b, b, b, b   };
 
 wire tape, tapeLed;
 ltc2308_tape ltc2308_tape
@@ -440,7 +432,73 @@ always @(posedge clock32) if(strb) case(code) 8'h01: F9 <= make; endcase
 
 //-------------------------------------------------------------------------------------------------
 
-wire reset = power && ready && F9 && !romIo && !RESET && !status[0] && !buttons[1];
+reg [22:0] timer_c;
+reg [1:0] state_c;
+reg old_status_12;
+reg inj_strb;
+reg inj_make;
+reg [7:0] inj_code;
+reg inj_reset;
+localparam [27:0] POWER_ON_TICKS = 28'd30000000;
+reg[27:0] power_on_cnt = 28'd0;
+reg        power_on_done = 1'b0;
+
+always @(posedge clock32) begin
+    old_status_12 <= status[12];
+    inj_strb <= 0;
+    inj_reset <= 0;
+    
+    if (status[12] && !old_status_12) begin
+        state_c <= 1;
+        timer_c <= 0;
+    end
+    if(!power) begin
+        power_on_cnt   <= 28'd0;
+        power_on_done  <= 1'b0;
+    end else begin
+        if(!power_on_done) begin
+            power_on_cnt <= power_on_cnt + 1'd1;
+            if(power_on_cnt == POWER_ON_TICKS) begin
+				state_c <= 1;
+				timer_c <= 0;
+                power_on_done  <= 1'b1;
+            end
+        end
+    end
+    case (state_c)
+        1: begin
+            inj_code <= 8'h21; // 'c' key
+            inj_make <= 0;
+            inj_strb <= 1;
+            state_c <= 2;
+        end
+        2: begin
+            if (timer_c >= 3200000 && timer_c < 3232000) begin
+                inj_reset <= 1; // 4.8s reset pulse
+            end
+
+            if (timer_c == 6400000) begin // 200ms // 5 seconds
+                state_c <= 3;
+            end else begin
+                timer_c <= timer_c + 1;
+            end
+        end
+        3: begin
+            inj_code <= 8'h21;
+            inj_make <= 1;
+            inj_strb <= 1;
+            state_c <= 0;
+        end
+    endcase
+end
+
+wire final_strb = strb | inj_strb;
+wire final_make = inj_strb ? inj_make : make;
+wire [7:0] final_code = inj_strb ? inj_code : code;
+
+//-------------------------------------------------------------------------------------------------
+
+wire reset = power && ready && F9 && !romIo && !RESET && !status[0] && !buttons[1] && !inj_reset;
 wire[1:0] speed = status[8:7];
 
 wire cecpu;
@@ -509,9 +567,9 @@ ep ep
 	.tape   (tape   ),
 	.left   (left   ),
 	.right  (right  ),
-	.strb   (strb   ),
-	.make   (make   ),
-	.code   (code   ),
+	.strb   (final_strb),
+	.make   (final_make),
+	.code   (final_code),
 	.mbtns  (mbtns  ),
 	.xaxis  (xaxis  ),
 	.yaxis  (yaxis  ),
@@ -621,7 +679,6 @@ always @(posedge CLK_VIDEO) if (ce_pix) begin
 	vbl <= VBlank;
 
 end
-	
 wire [21:0] gamma_bus;
 wire vcrop_en = en1080p ? |status[29:28] : status[28];
 wire vga_de;
@@ -638,20 +695,13 @@ video_freak video_freak
 video_mixer #( .GAMMA(1)) video_mixer
 (
 	.*,
-	.ce_pix(ce_pix),
-	.gamma_bus(gamma_bus),
-	.hq2x(scale == 1),
-	.scandoubler(scale || forced_scandoubler),
-	.freeze_sync(),
-
 	.VGA_DE(vga_de),
-	.HSync(hs),
-	.VSync(vs),
-	.HBlank(hbl),
-	.VBlank(vbl),
+	.hq2x(scale == 1),
+	.scandoubler(forced_scandoubler),
 	.B({b,b,b,b}),
 	.G({g,g,g[2:1]}),
-	.R({r,r,r[2:1]})
+	.R({r,r,r[2:1]}),
+	.freeze_sync()
 );
 assign memQ2 = rom || ram ? sdrQ[7:0] : 8'hFF;
 
